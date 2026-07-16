@@ -1,21 +1,99 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+"""
+Análisis de fuga de clientes (Bank Churners).
+
+Segmentación por límite de crédito y género, pruebas estadísticas
+(chi-cuadrado, t-test) y generación de visualizaciones.
+
+Uso:
+    python Analisis_TarjetaDeCredito.py
+    python Analisis_TarjetaDeCredito.py --data data/BankChurners.csv --out reports/figures
+"""
+import argparse
+import sys
 from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 from scipy import stats
 
-
 # ============================================================
-# CONFIGURACIÓN DE RUTAS
+# CONFIGURACIÓN
 # ============================================================
-DATA_PATH = Path("/home/velez/Practicas_Numpy-Pandas/BankChurners (1).csv")
-OUTPUT_DIR = Path("/home/velez/Practicas_Numpy-Pandas")
+BASE_DIR = Path(__file__).resolve().parent
 
+# Nombres de columnas auxiliares generadas por un clasificador Naive Bayes
+# que no aportan al análisis exploratorio (se descartan si existen).
 COLUMNAS_NAIVE_BAYES = [
     "Naive_Bayes_Classifier_Attrition_Flag_Card_Category_Contacts_Count_12_mon_Dependent_count_Education_Level_Months_Inactive_12_mon_1",
     "Naive_Bayes_Classifier_Attrition_Flag_Card_Category_Contacts_Count_12_mon_Dependent_count_Education_Level_Months_Inactive_12_mon_2",
 ]
+
+# Columnas que el resto del script asume que existen; si falta alguna,
+# preferimos fallar temprano con un mensaje claro en vez de un KeyError
+# a mitad de un cálculo.
+COLUMNAS_REQUERIDAS = [
+    "Attrition_Flag",
+    "Customer_Age",
+    "Gender",
+    "Credit_Limit",
+    "Total_Trans_Ct",
+    "Total_Trans_Amt",
+    "Months_Inactive_12_mon",
+]
+
+CATEGORIAS_FUGA = ["Attrited Customer", "Existing Customer"]
+
+
+# ============================================================
+# ARGUMENTOS DE LÍNEA DE COMANDOS
+# ============================================================
+def ParsearArgumentos(argv=None):
+    parser = argparse.ArgumentParser(description="Análisis de fuga de clientes (Bank Churners)")
+    parser.add_argument(
+        "--data",
+        type=str,
+        default=None,
+        help="Ruta al CSV de entrada (por defecto: data/BankChurners.csv junto al script, "
+        "o el primer .csv encontrado junto al script si esa ruta no existe)",
+    )
+    parser.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Directorio de salida para las gráficas (por defecto: reports/figures junto al script)",
+    )
+    return parser.parse_args(argv)
+
+
+def ResolverRutaDatos(ruta_argumento):
+    if ruta_argumento:
+        ruta = Path(ruta_argumento)
+        if not ruta.exists():
+            raise FileNotFoundError(f"No se encontró el archivo de datos indicado: {ruta}")
+        return ruta
+
+    ruta_por_defecto = BASE_DIR / "data" / "BankChurners.csv"
+    if ruta_por_defecto.exists():
+        return ruta_por_defecto
+
+    # Compatibilidad con el repo actual, donde el CSV vive junto al script
+    # con un nombre distinto (ej. "BankChurners (1).csv").
+    candidatos = sorted(BASE_DIR.glob("*.csv"))
+    if candidatos:
+        return candidatos[0]
+
+    raise FileNotFoundError(
+        "No se encontró ningún CSV de entrada. Usá --data para indicar la ruta "
+        "o colocá el archivo en data/BankChurners.csv"
+    )
+
+
+def ResolverDirectorioSalida(ruta_argumento):
+    directorio = Path(ruta_argumento) if ruta_argumento else (BASE_DIR / "reports" / "figures")
+    directorio.mkdir(parents=True, exist_ok=True)
+    return directorio
 
 
 # ============================================================
@@ -23,7 +101,17 @@ COLUMNAS_NAIVE_BAYES = [
 # ============================================================
 def CargarDatos(ruta):
     df = pd.read_csv(ruta)
-    df.drop(COLUMNAS_NAIVE_BAYES, axis=1, inplace=True)
+
+    columnas_a_eliminar = [c for c in COLUMNAS_NAIVE_BAYES if c in df.columns]
+    if columnas_a_eliminar:
+        df = df.drop(columns=columnas_a_eliminar)
+
+    columnas_faltantes = [c for c in COLUMNAS_REQUERIDAS if c not in df.columns]
+    if columnas_faltantes:
+        raise ValueError(
+            f"Faltan columnas requeridas en el dataset: {columnas_faltantes}"
+        )
+
     return df
 
 
@@ -40,29 +128,43 @@ class AnalizadorClientes:
         return resultado
 
     def SegmentaCredito(self):
-        condicion = self.df['Credit_Limit'].quantile(0.25)
-        self.df['Segmento_Credito'] = np.where(condicion, 'Credito bajo', 'Credito Alto')
+        # Comparación fila a fila contra el umbral del cuantil 25,
+        # no el escalar del cuantil en sí (ese era el bug original).
+        Condicion = self.df['Credit_Limit'] <= self.df['Credit_Limit'].quantile(0.25)
+        self.df['Segmento_Credito'] = np.where(Condicion, 'Credito bajo', 'Credito Alto')
         return self.df
-
-    def CruzarSegmento(self):
-        Cruce = self.df.groupby(['Segmento_Credito', 'Attrition_Flag']).size().unstack(fill_value=0)
-        Cruce['%_Fuga'] = (Cruce['Attrited Customer'] / (Cruce['Attrited Customer'] + Cruce['Existing Customer'])) * 100
-        return Cruce
 
     def SegmentoGenero(self):
         Condicion = self.df['Gender'] == 'M'
         self.df['Segmento_Genero'] = np.where(Condicion, 'Masculino', 'Femenino')
         return self.df
 
-    def CruzarGenero(self):
-        Cruce = self.df.groupby(['Segmento_Genero', 'Attrition_Flag']).size().unstack(fill_value=0)
-        Cruce['%_Fuga'] = (Cruce['Attrited Customer'] / (Cruce['Attrited Customer'] + Cruce['Existing Customer'])) * 100
+    def _TablaCruceConFuga(self, columnas_grupo):
+        """
+        Tabla de contingencia genérica contra Attrition_Flag, con las dos
+        categorías de fuga garantizadas (aunque el grupo no tenga ninguna
+        fila de una de ellas) y el porcentaje de fuga calculado.
+        """
+        Cruce = (
+            self.df.groupby(columnas_grupo)['Attrition_Flag']
+            .value_counts()
+            .unstack(fill_value=0)
+            .reindex(columns=CATEGORIAS_FUGA, fill_value=0)
+        )
+        Cruce['%_Fuga'] = (
+            Cruce['Attrited Customer']
+            / (Cruce['Attrited Customer'] + Cruce['Existing Customer']).replace(0, np.nan)
+        ) * 100
         return Cruce
 
+    def CruzarSegmento(self):
+        return self._TablaCruceConFuga(['Segmento_Credito'])
+
+    def CruzarGenero(self):
+        return self._TablaCruceConFuga(['Segmento_Genero'])
+
     def CruzarGenero_Credito(self):
-        Cruce = self.df.groupby(['Segmento_Genero', 'Segmento_Credito', 'Attrition_Flag']).size().unstack(fill_value=0)
-        Cruce['%_Fuga'] = (Cruce['Attrited Customer'] / (Cruce['Attrited Customer'] + Cruce['Existing Customer'])) * 100
-        return Cruce
+        return self._TablaCruceConFuga(['Segmento_Genero', 'Segmento_Credito'])
 
 
 # ============================================================
@@ -106,11 +208,15 @@ def ImprimirAnalisis(df, analizador, Clientes_Fugados, Clientes_Existentes):
     print("Cantidad:", mayores_5000.size)
 
     # --- NumPy: comparación fugados vs existentes ---
-    trans_fugados = Clientes_Fugados['Total_Trans_Ct'].to_numpy()
-    trans_existentes = Clientes_Existentes['Total_Trans_Ct'].to_numpy()
-    diferencia_promedio = trans_fugados.mean() - trans_existentes.mean()
-    print("\n--- Comparación de transacciones: Fugados vs Existentes ---")
-    print("Diferencia promedio (Fugados - Existentes):", diferencia_promedio)
+    if len(Clientes_Fugados) == 0 or len(Clientes_Existentes) == 0:
+        print("\n--- Comparación de transacciones: Fugados vs Existentes ---")
+        print("No hay suficientes datos en alguno de los dos grupos para comparar.")
+    else:
+        trans_fugados = Clientes_Fugados['Total_Trans_Ct'].to_numpy()
+        trans_existentes = Clientes_Existentes['Total_Trans_Ct'].to_numpy()
+        diferencia_promedio = trans_fugados.mean() - trans_existentes.mean()
+        print("\n--- Comparación de transacciones: Fugados vs Existentes ---")
+        print("Diferencia promedio (Fugados - Existentes):", diferencia_promedio)
 
     print("\n--- Meses inactivo (12m) ---")
     print(df['Months_Inactive_12_mon'].describe())
@@ -122,23 +228,30 @@ def ImprimirAnalisis(df, analizador, Clientes_Fugados, Clientes_Existentes):
         ("Género", analizador.CruzarGenero()),
     ]:
         tabla = Cruce.drop(columns='%_Fuga')
+        if (tabla.sum(axis=1) == 0).any() or tabla.shape[0] < 2:
+            print(f"{nombre}: no se pudo calcular (una categoría quedó sin datos)")
+            continue
         chi2, p, dof, _ = stats.chi2_contingency(tabla)
         print(f"{nombre}: chi2={chi2:.2f}, p-value={p:.4f}")
 
     # --- Significancia estadística (t-test) para variables continuas ---
     print("\n--- Significancia estadística: t-test (continuas) ---")
-    variables_continuas = ['Customer_Age', 'Total_Trans_Ct', 'Credit_Limit']
-    for variable in variables_continuas:
-        grupo_fugado = Clientes_Fugados[variable].to_numpy()
-        grupo_existente = Clientes_Existentes[variable].to_numpy()
-        t_stat, p_valor = stats.ttest_ind(grupo_fugado, grupo_existente, equal_var=False)
-        significativo = "sí" if p_valor < 0.05 else "no"
-        print(f"{variable}: t={t_stat:.2f}, p-value={p_valor:.4f} (significativo: {significativo})")
+    if len(Clientes_Fugados) == 0 or len(Clientes_Existentes) == 0:
+        print("No hay suficientes datos en alguno de los dos grupos para el t-test.")
+    else:
+        variables_continuas = ['Customer_Age', 'Total_Trans_Ct', 'Credit_Limit']
+        for variable in variables_continuas:
+            grupo_fugado = Clientes_Fugados[variable].to_numpy()
+            grupo_existente = Clientes_Existentes[variable].to_numpy()
+            t_stat, p_valor = stats.ttest_ind(grupo_fugado, grupo_existente, equal_var=False)
+            significativo = "sí" if p_valor < 0.05 else "no"
+            print(f"{variable}: t={t_stat:.2f}, p-value={p_valor:.4f} (significativo: {significativo})")
+
 
 # ============================================================
-# VISUALIZACIÓN (6 gráficas, un solo flujo)
+# VISUALIZACIÓN (7 gráficas, un solo flujo)
 # ============================================================
-def GenerarGraficas(df, analizador):
+def GenerarGraficas(df, analizador, output_dir):
     # 1) Distribución de edades
     plt.figure(figsize=(11, 6))
     sns.histplot(data=df, x='Customer_Age', bins=30, kde=True, color='blue')
@@ -147,7 +260,7 @@ def GenerarGraficas(df, analizador):
     plt.ylabel('Frecuencia', fontsize=14)
     plt.grid(axis='y', alpha=0.75)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / 'Distribucion_Edades.png', dpi=300)
+    plt.savefig(output_dir / 'Distribucion_Edades.png', dpi=300)
     plt.close()
 
     # 2) Transacciones: fugados vs existentes
@@ -157,7 +270,7 @@ def GenerarGraficas(df, analizador):
     plt.xlabel('Estado del Cliente', fontsize=14)
     plt.ylabel('Total de Transacciones', fontsize=14)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / 'Comparacion_Transacciones.png', dpi=300)
+    plt.savefig(output_dir / 'Comparacion_Transacciones.png', dpi=300)
     plt.close()
 
     # 3) % de fuga por segmento de crédito
@@ -169,7 +282,7 @@ def GenerarGraficas(df, analizador):
     plt.title('Comparación de Fuga por Segmento de Crédito', fontsize=16)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / 'Comparacion_Segmentos.png', dpi=300)
+    plt.savefig(output_dir / 'Comparacion_Segmentos.png', dpi=300)
     plt.close()
 
     # 4) % de fuga por género
@@ -181,7 +294,7 @@ def GenerarGraficas(df, analizador):
     plt.title('Comparación de Fuga por Género', fontsize=16)
     plt.xticks(rotation=0)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / 'Comparacion_Genero.png', dpi=300)
+    plt.savefig(output_dir / 'Comparacion_Genero.png', dpi=300)
     plt.close()
 
     # 5) Promedios por estado del cliente
@@ -205,7 +318,7 @@ def GenerarGraficas(df, analizador):
     plt.ylabel("Promedio", fontsize=12)
     plt.xticks(rotation=45)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "Promedios_por_estado.png", dpi=300)
+    plt.savefig(output_dir / "Promedios_por_estado.png", dpi=300)
     plt.close()
 
     # 6) Heatmap % de fuga por género y segmento de crédito
@@ -224,9 +337,10 @@ def GenerarGraficas(df, analizador):
     plt.xlabel("Segmento de crédito", fontsize=12)
     plt.ylabel("Género", fontsize=12)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / "Fuga_por_genero_y_credito.png", dpi=300)
+    plt.savefig(output_dir / "Fuga_por_genero_y_credito.png", dpi=300)
     plt.close()
-    #---7 Grafico del Test de Chi-cuadrado para el segmento de crédito---
+
+    # 7) Gráfico del test de chi-cuadrado para el segmento de crédito
     plt.figure(figsize=(8, 5))
     cruce_segmento = analizador.CruzarSegmento()
     cruce_segmento.drop(columns='%_Fuga').plot(kind='bar', stacked=True, color=["#00E1FF", "#F51818"])
@@ -235,26 +349,42 @@ def GenerarGraficas(df, analizador):
     plt.ylabel('Number of Customers')
     plt.xticks(rotation=0)
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / 'Chi_square_Credit_Segment.png', dpi=300)
+    plt.savefig(output_dir / 'Chi_square_Credit_Segment.png', dpi=300)
     plt.close()
 
-    print("\n--- Gráficos generados correctamente ---")
-    for nombre in [
+    nombres_generados = [
         "Distribucion_Edades.png",
         "Comparacion_Transacciones.png",
         "Comparacion_Segmentos.png",
         "Comparacion_Genero.png",
         "Promedios_por_estado.png",
         "Fuga_por_genero_y_credito.png",
-    ]:
-        print(f"- {OUTPUT_DIR / nombre}")
+        "Chi_square_Credit_Segment.png",
+    ]
+    print("\n--- Gráficos generados correctamente ---")
+    for nombre in nombres_generados:
+        print(f"- {output_dir / nombre}")
 
 
 # ============================================================
 # FLUJO PRINCIPAL
 # ============================================================
-def main():
-    df = CargarDatos(DATA_PATH)
+def main(argv=None):
+    argumentos = ParsearArgumentos(argv)
+
+    try:
+        ruta_datos = ResolverRutaDatos(argumentos.data)
+    except FileNotFoundError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+    directorio_salida = ResolverDirectorioSalida(argumentos.out)
+
+    try:
+        df = CargarDatos(ruta_datos)
+    except ValueError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
 
     analizador = AnalizadorClientes(df)
     analizador.SegmentaCredito()
@@ -264,11 +394,11 @@ def main():
     Clientes_Existentes = df[df["Attrition_Flag"] == 'Existing Customer']
 
     ImprimirAnalisis(df, analizador, Clientes_Fugados, Clientes_Existentes)
-    GenerarGraficas(df, analizador)
+    GenerarGraficas(df, analizador, directorio_salida)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-
+    sys.exit(main())
 
 
